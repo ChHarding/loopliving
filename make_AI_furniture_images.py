@@ -1,10 +1,10 @@
 import os
-import base64
 import json
 import re
 import pandas as pd
-from keys import OpenAI_key
+import requests
 from openai import OpenAI
+from keys import OpenAI_key
 
 # Use OPENAI_API_KEY env var (do not hardcode)
 client = OpenAI(api_key=OpenAI_key)
@@ -14,10 +14,10 @@ client = OpenAI(api_key=OpenAI_key)
 # official OpenAI image-generation pricing for the model & size you use.
 # Keys: (model_name, size). Values: price per image in USD.
 DEFAULT_PRICE_MAP = {
-    ("gpt-image-1", "1024x1024"): 0.02,    
-    ("gpt-image-1", "1024x1536"): 0.03,
-    ("gpt-image-1", "1536x1024"): 0.03,
-    ("gpt-image-1", "auto"): 0.02,         
+# DALL-E 3 pricing - HD quality
+    ("dall-e-3-hd", "1024x1024"): 0.080,    # HD quality
+    ("dall-e-3-hd", "1024x1536"): 0.120,    # HD quality
+    ("dall-e-3-hd", "1536x1024"): 0.120,    # HD quality
 }
 # Allowed image sizes (only these are accepted by the API)
 ALLOWED_SIZES = {"1024x1024", "1024x1536", "1536x1024", "auto"}
@@ -85,13 +85,23 @@ def prompt_from_params(category, material, color, series=None, style=None, attri
     attributes_part = f", {attributes}" if attributes and pd.notna(attributes) else ""
     extras = ", ".join([p for p in (loc_phrase, sea_phrase) if p])
     extras_part = f", featuring {extras}" if extras else ""
+    '''
     return (
         #f"A {color} {material} {category}, {style}{extras_part}, product-style photo on a clean white background, "
         #"studio lighting, high detail, high resolution."
-        #f"You are a furniture designer."
-        f"A {color} {material} {full_category}, {final_style}{extras_part}, commercial product photography, on a seamless light gray background, "
+        f"You are a furniture designer."
+        f"Create an image for a {color} {material} {full_category}, {final_style}{extras_part}, commercial product photography, on a seamless light gray background, "
         f"with soft studio lighting and subtle shadows{attributes_part}, high detail, high resolution."
+    )'''
+    return (
+        f"You are a modern furniture product designer creating clean product photography. "
+        f"Create a product photography of a single piece of a {color} {material} {full_category}, {final_style} style{extras_part}{attributes_part}. "
+        f"Clean white studio background, professional lighting, high resolution, minimalist composition, no other furniture or props. "
+        f"Remove all text, remove all words, remove all letters, remove all typography, remove all branding items, "
+        f"remove all labels and graphic design elements completely from the image."
+        f"IMPORTANT: Do not include any text, labels, words, letters, or typography in the image."
     )
+
 
 def _safe(s):
     s = "" if s is None else str(s)
@@ -99,29 +109,41 @@ def _safe(s):
     s = re.sub(r'[^a-z0-9]+', '_', s)
     return s.strip('_') or 'none'
 
-def generate_and_save_image(row_id, category, material, color, location=None, season=None,
-                            out_folder="Pictures", size="1024x1024", style="photorealistic",
-                            model="gpt-image-1", price_map=None):
+def generate_and_save_image(row_id, category, material, color, series=None, style=None, 
+                           attributes=None, location=None, season=None,
+                            out_folder="Pictures", size="1024x1024", 
+                            model="dall-e-3", price_map=None):
     """Generate a single image and save it into out_folder folder. Filename derived from inputs."""
     if size not in ALLOWED_SIZES:
         raise ValueError(f"size must be one of {sorted(ALLOWED_SIZES)}")
 
-    prompt = prompt_from_params(category, material, color, location=location, season=season, style=style)
-    #resp = client.images.generate(
-    #    model=model,
-    #    prompt=prompt,
-    #    size=size
-    #)
-    print(f"DEBUG: Prompt for row {idx} is: {prompt}")
+    prompt = prompt_from_params(category, material, color, series=series, style=style, 
+                               attributes=attributes, location=location, season=season)
+    
+    print(f"DEBUG: Prompt for row {row_id} is: {prompt}")
+    
+    # Request image with URL response format instead of base64
     resp = client.images.generate(
         model="dall-e-3",
-        prompt="Your are a furniture designer. <rest of prompt>.",
+        prompt=prompt,
         size="1024x1024",
         quality="standard",
-        n=1
+        n=1,
+        response_format="url"  # This tells OpenAI to return a URL instead of base64
     )
-    b64 = resp.data[0].b64_json
-    image_bytes = base64.b64decode(b64)
+    
+    # Get the image URL from the response
+    image_url = resp.data[0].url
+    print(f"DEBUG: Image URL for row {row_id}: {image_url}")
+    
+    # Download the image from the URL
+    try:
+        response = requests.get(image_url, timeout=30)
+        response.raise_for_status()  # Raises an HTTPError for bad responses
+        image_bytes = response.content
+    except requests.exceptions.RequestException as e:
+        print(f"Error downloading image from URL: {e}")
+        raise
 
     # Ensure output folder exists (out_folder is treated as a folder)
     os.makedirs(out_folder or ".", exist_ok=True)
@@ -137,37 +159,54 @@ def generate_and_save_image(row_id, category, material, color, location=None, se
     filename = base + ".png"
     full_path = os.path.join(out_folder, filename)
 
-
     # Save the image file
     with open(full_path, "wb") as f:
         f.write(image_bytes)
+    print(f"DEBUG: Saved image to: {full_path}")
+
+    # Create JSON metadata file path (same base name, but .json extension)
+    json_filename = base + ".json"
+    json_full_path = os.path.join(out_folder, json_filename)
 
     # Save a small JSON sidecar with parameters and prompt for traceability
-    estimated_cost = estimate_image_cost(model, size, price_map=price_map)
+    #estimated_cost = estimate_image_cost("dall-e-3", size, price_map=price_map)
     meta = {
         "row_id": row_id,
         "category": category,
+        "series": series,
+        "style": style,
         "material": material,
         "color": color,
+        "attributes": attributes,
         "location": location,
         "season": season,
         "prompt": prompt,
         "size": size,
         "model": model,
-        "file": full_path,
-        "estimated_cost_usd": estimated_cost,
+        "image_file": full_path,
+        "json_file": json_full_path,
     }
-    with open(full_path + ".json", "w", encoding="utf-8") as jf:
-        json.dump(meta, jf, indent=2)
+    
+    # Save JSON metadata file
+    try:
+        with open(json_full_path, "w", encoding="utf-8") as jf:
+            json.dump(meta, jf, indent=2)
+        print(f"DEBUG: Saved JSON metadata to: {json_full_path}")
+    except Exception as e:
+        print(f"ERROR: Could not save JSON metadata to {json_full_path}: {e}")
+        raise
 
     return full_path, meta
 
 # Example usage (Windows path shown)
 if __name__ == "__main__":
 
-    # read in furniture_table_small_csv into a dataframe
-    import pandas as pd
-    df = pd.read_csv("furniture_table_with_images.csv")
+    # read in furniture_data_generated.csv into a dataframe
+    df = pd.read_csv("furniture_data_generated.csv")
+    
+    # Add img column if it doesn't exist
+    if 'img' not in df.columns:
+        df['img'] = ''
 
     GENERATION_LIMIT = 100 # max number of images to generate in one run
     generated_count = 0
@@ -175,7 +214,7 @@ if __name__ == "__main__":
     # iterate over rows and generate images
     for idx, row in df.iterrows():
         # skip if img column is already populated
-        if pd.notna(row.get('img')):
+        if pd.notna(row.get('img')) and row.get('img') != '':
             print(f"Skipping row {idx} (img already exists)")
             continue    
 
@@ -183,9 +222,9 @@ if __name__ == "__main__":
         image_path, meta = generate_and_save_image(
             row_id=idx,
             category=row['category'],
-            #series=row.get('series'),
-            #style=row.get('style'),
-            #attributes=row.get('attributes'),
+            series=row.get('series'),
+            style=row.get('style'),
+            attributes=row.get('attributes'),
             material=row['material'],
             color=row['color'],
             location=row.get('location'),
@@ -196,8 +235,11 @@ if __name__ == "__main__":
         # print all input values used to generate the image
         print(f"Row ID: {idx}")
         print(f"Category: {row['category']}")
+        print(f"Series: {row.get('series')}")
+        print(f"Style: {row.get('style')}")
         print(f"Material: {row['material']}")
         print(f"Color: {row['color']}")
+        print(f"Attributes: {row.get('attributes')}")
         print(f"Location: {row.get('location')}")
         print(f"Season: {row.get('season')}")   
         print("Saved:", image_path)
@@ -206,7 +248,7 @@ if __name__ == "__main__":
         # insert image path into img column of dataframe
         df.at[idx, 'img'] = os.path.basename(image_path)
         # save updated dataframe 
-        df.to_csv("furniture_table_with_images.csv", index=False) 
+        df.to_csv("furniture_data_generated.csv", index=False) 
         #break # test one row only
         generated_count += 1
         if generated_count >= GENERATION_LIMIT:
